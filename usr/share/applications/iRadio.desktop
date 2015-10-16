@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=iRadio
+Comment=Internet Radio Player-Ripper
+Comment[ru]=Прослушивание и захват интернет-радиостанций
+Exec=/usr/bin/iradio
+Icon=/usr/share/icons/hicolor/128x128/apps/iRadio.png
+Terminal=true
+Type=Application
+Categories=Application;AudioVideo;
+Name[ru_RU]=iRadio

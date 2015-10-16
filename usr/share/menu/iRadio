@@ -1,0 +1,6 @@
+?package(iradio):needs="X11" section="Applications/AudioVideo" \
+	title="iRadio" \
+	longtitle="Internet Radio Player-Ripper" \
+	command="/usr/bin/iradio" \
+	icon="/usr/share/icons/hicolor/24x24/apps/iRadio.png" \
+	description="Internet Radio"

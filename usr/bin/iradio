@@ -1,0 +1,374 @@
+#!/bin/bash
+# Скрипт для записи интернет-радиостанций.
+
+MYDIR="${HOME}/radio"
+CONFDIR="${HOME}/.config/iradio"
+MPL="${CONFDIR}/onlineradio.lst"
+LAST="${CONFDIR}/last_station"
+HEIGHT=385
+WIDTH=300
+TIMEOUT=5
+DEFSERVER=3
+SERVERS=( ru1 ru2 eu4 eu7 nbn )
+FORMATS="mp3 nsv aac ogg"
+TITLE="\"iRadio\""
+MENU="Вернуться в меню"
+ADST="Добавить/удалить станцию"
+LABEL="...."
+CODEPAGE="--codeset-filesys=utf-8 --codeset-metadata=cp1251"
+USERAGENT="Mozilla/5.0"
+FADE=8				# время затухания звука
+EDAF=3				# время нарастания громкости
+SUBDIR="completed"	# субдиректория готовых файлов
+
+tmp0=$(/bin/mktemp)
+tmp1=$(/bin/mktemp)
+snapshot=$(/bin/mktemp)
+pass=
+STATION_LIST=
+pid_sr=
+pid_mp=
+current=			# текущая станция
+CAPTION=			# шапка
+stname=
+savename=
+saveurl=
+server101=
+URL=
+EXT=
+RFR=
+
+if [ ! -d "$CONFDIR" ];then mkdir "$CONFDIR"; fi
+if [ ! -f "$MPL" ];then	# создаю дефолт-плейлист станций
+cat << EOF > "$MPL"
+Store N Forward @storenforward - Podcast Episode 358|http://195.154.71.125:8002
+NRJ Trance|c13_3
+Club Dance|c4_2
+Electronic|c15_20
+Радио \"Рекорд\" 320kb|http://air.radiorecord.ru:8101/rr_320
+Радио \"Рекорд\" 128kb|http://air.radiorecord.ru:8101/rr_128
+Классика жанра 128kb|c4_1
+Анекдоты 128kb|c3_5
+Юмор Non-Stop 128kb|c2_4
+Юмор ФМ|v5_1
+Радио Фантастики 32kb|http://fantasyradioru.no-ip.biz:8008
+Радио Фантастики 96kb|http://fantasyradioru.no-ip.biz:8002/live
+ZaycevFM|http://zaycev.fm:9002/ZaycevFM(128)
+Dance Club|http://music.myradio.com.ua:8000/dance128.mp3
+Eurodance-90|http://listen.radionomy.com/eurodance-90
+EOF
+fi
+
+read_stations(){	# чтение сохраненного списка
+	if [ -z "$current" ];then
+		if [ -f "$LAST" ];then
+			current=$(cat "$LAST")
+		fi
+	fi
+	STATION_LIST=""
+	while read line;do
+		if [ "$current" = "$line" ]; then res=TRUE; else res=FALSE; fi
+		if [ -n "$STATION_LIST" ];then STATION_LIST="${STATION_LIST}|";	fi
+		STATION_LIST="${STATION_LIST}${res}|${line}"
+	done < "$MPL"
+}
+
+delete_station(){	# удаление станции из списка
+	while [ 1 ];do
+		read_stations
+		IFS=$'|'
+		choise=$(zenity --list --radiolist --column 'Выбор' \
+			--column 'Название станции' --column 'Адрес потока'	\
+			--text="Выбери станцию для удаления:" \
+			--title="Удаление станции" ${STATION_LIST} 2>/dev/null)
+		res=$?
+		unset IFS
+		if [ ! $res -eq 0 ] || [ -z "$choise" ];then return; fi
+		zenity --question --title=${TITLE} --text="Удалить ${choise}?" 2>/dev/null
+		if [ $? -eq 0 ];then
+			sed -i /"$choise"/d "$MPL"
+			grep '.' "$MPL"|sed '/./,$!d' > "$tmp0" #удаляю пустые строки
+			mv "$tmp0" "$MPL"
+			if [ "$current" = "$choise" ]; then unset current; fi
+		fi
+	done
+}
+
+get_snap(){
+# не нашел как определить свежезаписанные риппером файлы за сим делаю
+# снапшоты папки и сравниваю "до" и "после" - разница свежезаписанное
+	if [ -f "$1" ];then rm "$1";fi
+	IFS=$' '
+	for i in $(echo "$FORMATS"); do
+		find -L "$MYDIR" -name "*.${i}" >> "$1"
+	done
+	unset IFS
+}
+
+get_server(){
+	EXT="${CODEPAGE} -d ${MYDIR}"
+	RFR=""
+	if [ "${URL:0:4}" = "${LABEL}" ]; then # добавление новой станции
+		stname="$savename"
+		URL="$saveurl"
+		rdate=$(zenity --forms --separator=';' --title="${TITLE}" \
+		--text="Данные о новой радиостанции" --add-entry="Название" \
+		--add-entry="IP Адрес потока" \
+		--cancel-label="Удалить существующую станцию..." 2>/dev/null)
+		if [ $? -eq 1 ];then delete_station; return 1; fi
+		urls=$(echo ${rdate}|cut -d ';' -f2)
+		if [ -z "$urls" ];then return 1; fi
+		URL="$urls"
+		stname=$(echo ${rdate}|cut -d ';' -f1|sed -e 's\|\-\')
+		if [ -z "$stname" ];then stname="Nameless";fi
+		current="${stname}|${URL}"
+		echo "$current" >> "$MPL"
+		awk '!_[$0]++' "$MPL" > "$tmp0" # удаляю дубликаты станций
+		mv "$tmp0" "$MPL"
+	elif [ ! ${URL:0:4} = "http" ]; then
+		if [ -z "$server101" ];then 	#создаю ссылку из индекса 101.ru
+			if [ -n "$stname" ]; then
+			IFS=$'|'				#выбираю сервер
+			server101=$(zenity --list --radiolist --title="${TITLE}" \
+			--column='Выбор' --column='Сервер' --text="Выбор сервера 101.ru" \
+			--timeout=$TIMEOUT `i=0; while [ ${SERVERS[i]} ];do \
+			if [ $i == 2 ];then flag=TRUE;else flag=FALSE;fi; echo -n \
+			"$flag|http://${SERVERS[i]}.101.ru:8000/|";((i++));done` 2>/dev/null)
+			fi
+			if [ -z $server101 ];then # дефолтный сервер
+				server101="http://${SERVERS[$DEFSERVER]}.101.ru:8000/"; fi
+			unset IFS
+		fi
+		URL=${server101}${URL}
+		EXT="${EXT} -u ${USERAGENT}"
+		RFR="--user-agent=$USERAGENT"
+	fi
+	return 0
+}
+
+cd
+if [ ! -d ${MYDIR} ]; then mkdir ${MYDIR}; fi
+if [ "$(pidof mplayer)" ]; then kill -15 $(pidof mplayer); fi
+
+get_snap "$snapshot"
+
+while [ 1 ]; do
+	read_stations
+
+	if [ -z "$stname" ]; then
+		if [ -n "$current" ];then	CAPTION="$(echo $current|cut -d '|' -f1)"
+			URL=$(echo "$current"|cut -d '|' -f2)
+			get_server
+			mplayer "$URL" "$RFR" -cache 500 &
+			pid_mp=$!
+			saveurl="$URL"
+		else						CAPTION="Выбор станции";fi
+	else							CAPTION="$stname"; fi
+	
+	
+	IFS=$'|' # меню выбора станции
+	STATIONS="${STATION_LIST}|FALSE|${ADST}|${LABEL}"
+	choise=$(zenity --list --radiolist --column 'Выбор' \
+	--column 'Название станции'	--column 'Поток'\
+	--height=$HEIGHT --width=$WIDTH --text="Выбери станцию из списка:" \
+	--title="${CAPTION}" --print-column=ALL --cancel-label="Выход" \
+	--ok-label='OK/Запись' ${STATIONS} 2>/dev/null)
+	if [ ! $? -eq 0 ];then break; fi
+	unset IFS
+	if [ -z "$choise" ];then continue; fi
+
+	if [ ! "$(echo $choise|cut -d '|' -f2)" = "$LABEL" ]; then
+		echo "${choise}" > "$LAST"; fi
+	current="$(cat "$LAST")"
+
+	stname=$(echo $choise|cut -d '|' -f1)
+	if [ ! "$stname" = "$ADST" ];then savename="$stname"; saveurl="$URL"
+	fi
+
+	URL=$(echo ${choise}|awk -F "|" '{print $2}')
+	get_server
+	if [ $? -eq 1 ];then continue; fi
+	
+	if [ ! "$saveurl" = "$URL" ]; then
+		#запускаю проигрывание
+		if [ "$pid_mp" ];then kill -15 $pid_mp; pid_mp="" ; fi
+		mplayer -quiet "$URL" "$RFR" -cache 500 &
+		pid_mp=$!
+		saveurl="$URL"
+		continue
+	fi
+	
+	#начинаю рип
+	#параметр перезаписи -o (always | never | larger | version)
+	if [ -n "$(echo $current|grep 'Юмор\|Анекдот\|Фантастик')" ]; then
+		streamripper ${URL} ${EXT} -r 8187 --with-id3v1 -q -o larger 2>&1 &	# -t -q -D "%S/%A/%T"
+		pid_sr=$!
+	else
+		streamripper ${URL} ${EXT} -r 8187 --with-id3v1 -o larger 2>&1 &
+		pid_sr=$!
+	fi
+	sleep 4
+		
+	# переключаю проигрывание на ретрансляцию со стримриппера дабы
+	# трафик не дублировать
+	kill -15 $pid_mp
+	mplayer -quiet -cache 100 http://localhost:8187 2>/dev/null &
+	pid_mp=$!
+
+	i="";a=""
+	while [ 1 ];do # жду изменений в рабочей папке
+		if [ ! "$(pidof zenity)" ]; then break; fi
+		a=$(inotifywait -qr -e modify --format '%f' "$MYDIR")
+		if [ "$a" = "$i" ];then continue;fi
+		echo "# Идет захват:\r\n$a"; i="$a"
+	done  | zenity --progress --width=350 --text="${stname}" \
+	--pulsate --title="Рип: ${stname}" 2>/dev/null
+	kill -15 $pid_sr # возвращаю проигрывание с сервера
+	mplayer -quiet "$URL" "$RFR" -cache 500 2>/dev/null &
+	res=$!
+	sleep 3
+	kill -15 $pid_mp 2>/dev/null
+	pid_mp=$res
+done
+if [ "$pid_mp" ]; then kill -15 $pid_mp; pid_mp=""; fi
+
+encode(){
+	arg="$*"
+	full_path=
+	while read line; do	#поиск полного пути - grep реагирует на []
+		a=${line##*/}
+		if [ "$a" = "$arg" ];then full_path=${line:2}; break; fi
+	done < $tmp0
+	if [ -z "$full_path" ];then return 0; fi
+	# обрезаю "хвосты" у файлов со 101.ru и удаляю символы [|] дабы не мешали
+	bn=$(echo ${arg}|sed -e 's/ - 0-00\.mp3//' -e 's/\.mp3//' -e 's/\[/(/g' -e 's/\]/)/' -e 's/|/-/')
+	ndir=$(echo ${full_path%/*} | sed -e 's/\/incomplete$//')
+	ndir="$ndir/${SUBDIR}"
+	if [ ! -d "$ndir" ];then mkdir "$ndir"; fi
+
+	nname="${ndir}/${bn}.ogg"
+	if [ -n "$(echo $bn|grep '^[0-9]\{4\}_')" ]; then
+		akkum=0
+		for res in "$ndir"/*; do
+			arg=$(echo ${res##*/}|sed -n 's/^\([0-9]\{4\}\).*/\1/p')
+			if [ -z $arg ];then continue; fi
+			arg=$(expr $arg / 1)
+			if [ $arg -gt $akkum ]; then akkum=$arg; fi
+		done
+		((akkum++))
+		nname="${ndir}/$(printf '%04d' $akkum)$(echo $bn|sed -e 's/^[0-9]\{4\}//').ogg"
+	else
+		cnt=0
+		while [ -f "$nname" ];do		
+			nname="${ndir}/${bn}("${cnt}").ogg"
+			((cnt++))
+		done
+	fi
+	
+	notify-send "$TITLE" "Обрабатываю: $bn" -t 10000
+	_ARTIST=$(soxi "$full_path" 2>/dev/null|grep Artist=|cut -d = -f2)
+	_TITLE=$(soxi "$full_path" 2>/dev/null|grep Title=|cut -d = -f2|sed -e 's/ - 0:00$//')
+	dur=$(soxi "$full_path" 2>/dev/null|grep Duration|awk '{print $3}')
+	if [ -n $dur ];then
+		if [ "${dur:0:5}" = "00:00" ];then # если файл меньше минуты фейд излишен
+			sox "$full_path" -t wav - 2>/dev/null |\
+			oggenc - --quiet -q 0 -t "$_TITLE"  -a  "$_ARTIST" -o "$nname"
+		else
+			sox "$full_path" -t wav - fade t $EDAF $dur $FADE 2>/dev/null |\
+			oggenc - --quiet -t "$_TITLE"  -a  "$_ARTIST" -o "$nname"
+		fi
+	fi
+	if [ -f "$nname" ]; then echo $nname; fi
+	rm "$full_path" >/dev/null 2>&1
+	return 0
+}
+
+# редактирование скачанных файлов
+get_snap "$tmp0"
+diff "$snapshot" "$tmp0" | grep "> " > "$tmp1"
+sort "$tmp1" > "$tmp0"
+if [ $(cat "$tmp0"|wc -l) -gt 0 ];then
+	new_list=
+	plist=					 #проверка есть-ли новые файлы
+	while read line; do
+		if [ -n "$plist" ];then plist="${plist}|"; fi
+		plist="${plist}${line##*/}"
+	done < "$tmp0"
+	while [ 1 ]; do
+		IFS=$'|'
+		choise=$(zenity --list --column='Трек:' \
+				--text="Были рипнуты треки:" --title="${TITLE}"\
+				--cancel-label="Закончить" ${plist} 2>/dev/null)
+		res=$?
+		if [ $res -eq 1 ];then 
+			for line in $plist; do
+				echo "# Идет обработка файла:\r\n$line"
+				if [ -n "$new_list" ];then new_list="${new_list}|"; fi
+				new_list="${new_list}$(encode $line)"
+			done | zenity --progress --width=350 --text="Начинаю обработку файлов." \
+						--pulsate --auto-close --title="Обработка аудиофайлов" 2>/dev/null			
+			unset IFS
+			break
+		fi
+		unset IFS
+		if [ -z "$choise" ];then continue; fi
+		while read line; do	#поиск полного пути - grep реагирует на []
+			a=${line##*/}
+			if [ "$a" = "$choise" ];then full_path=${line:2}; break; fi
+		done < $tmp0
+		mplayer "$full_path" &
+		pid_mp=$!
+		newlist=	# удаляю имя файла из списка
+		IFS=$'|'
+		for ln in $plist; do
+			if [ ! "$ln" = "$choise" ];then
+				if [ -n "$newlist" ];then newlist="${newlist}|";fi
+				newlist="${newlist}${ln}"
+			fi
+		done
+		unset IFS
+		plist="$newlist"
+		
+		zenity --question --title="$TITLE" --text="$choise" \
+		--cancel-label="Удалить" --ok-label="Сохранить"  2>/dev/null
+		if [ $? -eq 0 ];then
+			if [ -n "$new_list" ];then new_list="${new_list}|"; fi
+			new_list="${new_list}$(encode $choise)"
+		else rm "$choise"
+		fi
+		if [ $pid_mp ]; then kill -15 $pid_mp 2>/dev/null; pid_mp=""; fi
+		if [ -z "$plist" ]; then break; fi
+	done
+	
+	if [ -n "$new_list" ];then	# формирую плей	лист
+		if [ -d "${HOME}/Desktop" ];then dname="${HOME}/Desktop"
+		else if [ -d "${HOME}/Рабочий стол" ];then
+			 dname="${HOME}/Рабочий стол"
+		else dname="${HOME}"; fi; fi
+		fname="${dname}/records.m3u8"
+		lname="${dname}/$(date +'%d%b-%T').m3u8"
+		if [ ! -f "$fname" ];then echo "#EXTM3U" > "$fname";fi
+		echo "#EXTM3U" > "$lname"
+		IFS=$'|'
+		for line in $new_list; do
+			if [ -n "$line" ];then
+				title=${line##*/}; title=${title::-4}
+				dur=$(soxi "${line}"|grep Duration|awk '{print $3}'|sed -e 's/\..*//')
+				h=$(echo ${dur:0:2}|sed 's\^0\\')
+				m=$(echo ${dur:3:2}|sed 's\^0\\')
+				s=$(echo ${dur:6:2}|sed 's\^0\\')
+				dur=$((h*3600+m*60+s))
+				echo "#EXTINF:${dur},${title}" >> "$fname"
+				echo "#EXTINF:${dur},${title}" >> "$lname"
+				echo "${line}" >> "$fname"
+				echo "${line}" >> "$lname"
+				echo "" >> "$fname"
+				echo "" >> "$lname"
+			fi
+		done
+		unset IFS
+	fi
+fi
+if [ $pid_mp ]; then kill -15 $pid_mp; pid_mp=""; fi
+rm "$snapshot" "$tmp0" "$tmp1" >/dev/null 2>&1
+notify-send -t 4000 "$TITLE" "Bay=)"

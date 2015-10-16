@@ -1,0 +1,9 @@
+Package: iradio
+Version: 1.1
+Architecture: all
+Depends: zenity, mplayer2, streamripper, inotify-tools, sox
+Priority: optional
+Installed-Size: 212.5
+Section: Applications/Media
+Maintainer: Terechov Wladislav <asgrem@gmail.com>
+Description: Internet Radio Player-Ripper
